@@ -1,0 +1,74 @@
+import torch.nn as nn
+import torch
+
+class BasicConv(nn.Module):
+    def __init__(self, inplanes, outplanes, kernel_size=3, stride=1, padding=1, ratio=1.0):
+        super(BasicConv, self).__init__()
+        # 只要输入通道数大于3，就需要对通道进行通道剪枝（刚输入的图片的通道数为3）
+        if inplanes > 3:
+            inplanes = int(inplanes*ratio)
+        # 对输出通道进行通道剪枝桠
+        outplanes = int(outplanes*ratio)
+        # conv-bn-relu
+        self.conv = nn.Conv2d(inplanes, outplanes, kernel_size, stride=stride, padding=padding, bias=False)
+        self.bn = nn.BatchNorm2d(outplanes)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, input):
+        '''前向传播'''
+        x = self.conv(input)
+        x = self.bn(x)
+        x = self.relu(x)
+
+        return x
+
+
+class CifarNet(nn.Module):
+    def __init__(self, ratio=1.0):
+        super(CifarNet, self).__init__()
+        # conv0-conv1-conv2-conv3
+        self.gconv0 = BasicConv(3, 64, padding=0, ratio=ratio)
+        self.gconv1 = BasicConv(64, 64, ratio=ratio)
+        self.gconv2 = BasicConv(64, 128, stride=2, ratio=ratio)
+        self.gconv3 = BasicConv(128, 128, ratio=ratio)
+        # dropout3
+        self.drop3 = nn.Dropout2d()
+        # conv4-conv5-conv6
+        self.gconv4 = BasicConv(128, 128, ratio=ratio)
+        self.gconv5 = BasicConv(128, 192, stride=2, ratio=ratio)
+        self.gconv6 = BasicConv(192, 192, ratio=ratio)
+        # dropout6
+        self.drop6 = nn.Dropout2d()
+        # conv7
+        self.gconv7 = BasicConv(192, 192,ratio=ratio)
+        # AvgPooling
+        self.pool = nn.AvgPool2d(8)
+        # fc
+        self.fc = nn.Linear(int(192*ratio), 10)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = self.gconv0(x)
+        x = self.gconv1(x)
+        x = self.gconv2(x)
+        x = self.gconv3(x)
+        x = self.drop3(x)
+        x = self.gconv4(x)
+        x = self.gconv5(x)
+        x = self.gconv6(x)
+        x = self.drop6(x)
+        x = self.gconv7(x)
+        x = self.pool(x)
+        x = x.view(batch_size, -1)
+        x = self.fc(x)
+
+        return  x
+
+if __name__ == '__main__':
+    model = CifarNet(1.0)
+    print('Number of model parameters: {}'.format(
+        sum([p.data.nelement() for p in model.parameters()])))
+
+    x = torch.rand((2,3,32,32))
+    out = model(x)
+    print('out size:{0}'.format(out.size()))

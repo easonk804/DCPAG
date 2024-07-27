@@ -1,0 +1,389 @@
+import argparse
+import os
+import shutil
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim
+import torch.utils.data
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import logging
+import sys
+from CifarNet import CifarNet
+from DyReLUCifarNet import DyReLUCifarNet
+from DyReLUResNet import DyReLUResNetCifar
+from FBSCifarNet import FBSCifarNet
+from FBSResNet import FBSResNetCifar
+from tensorboard_logger import configure, log_value
+
+# 获得日志信息
+logging.getLogger().setLevel(logging.INFO)
+
+# 向参数解析模块中添加参数
+parser = argparse.ArgumentParser(description='PyTorch DynamicChannelExecution Training')
+# epoch
+parser.add_argument('--epochs', default=300, type=int,
+                    help='number of total epochs to run')
+# start_epoch
+parser.add_argument('--start-epoch', default=0, type=int,
+                    help='manual epoch number (useful on restarts)')
+# batch_size
+parser.add_argument('-b', '--batch-size', default=64, type=int,
+                    help='mini-batch size (default: 64)')
+# learning rate
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    help='initial learning rate')
+# momentum
+parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
+# weight decay
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+                    help='weight decay (default: 1e-4)')
+# print interval
+parser.add_argument('--print-freq', '-p', default=10, type=int,
+                    help='print frequency (default: 10)')
+# data augmentation
+parser.add_argument('--no-augment', dest='augment', action='store_false',
+                    help='whether to use standard augmentation (default: True)')
+# latest checkpoint path
+parser.add_argument('--resume', default='', type=str,
+                    help='path to latest checkpoint (default: none)')
+# the name of experiment
+parser.add_argument('--name', default='DenseNet_BC_100_12', type=str,
+                    help='name of experiment')
+# tensorboard
+parser.add_argument('--tensorboard',help='Log progress to TensorBoard', action='store_true')
+# evaluate mode
+parser.add_argument('--eval',help='evaluate mode', action='store_true')
+# reduction
+parser.add_argument("--reduction", type=int, default=16)
+# clip
+parser.add_argument("--clip", type=float, default=5.0)
+# baseline
+parser.add_argument('--baseline',help='run baseline model resnet18', action='store_true')
+# alpha
+parser.add_argument("--alpha", type=float, default=1e-2)
+# gated
+parser.add_argument("--gated", action='store_true')
+# lambda
+parser.add_argument("--lamda", type=float, default=1e-8)
+# ratio
+parser.add_argument("--ratio", type=float, default=1.0)
+# parallel
+parser.add_argument('--parallel',help='data parallel', action='store_true')
+# model depth
+parser.add_argument("--depth", type=int, default=18, help='model depth')
+
+parser.set_defaults(augment=True)
+
+best_prec1 = 0
+# 解析参数
+args = parser.parse_args()
+
+def main():
+    global best_prec1, args
+    # Log
+    log_format = '[%(asctime)s] %(message)s'
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,format=log_format, datefmt='%d %I:%M:%S')
+    log_path = os.path.join('./runs/%s/log'%(args.name))
+
+    # 如果存储日志的文件夹不存在，就创建
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+    # 日志文件
+    log_file = os.path.join(log_path, 'log.txt')
+    # 将日志文件写入到磁盘空间，返回一个fh对象
+    fh = logging.FileHandler(os.path.join(log_file))
+    # 设置日志的格式
+    fh.setFormatter(logging.Formatter(log_format))
+    # 向日志中添加fh对象
+    logging.getLogger().addHandler(fh)
+
+    logging.info("args = %s", args)
+
+    if args.tensorboard: configure("runs/%s" % (args.name))
+
+    # Data loading code
+    normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
+                                     std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
+    # 数据增强
+    if args.augment:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+
+        ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        normalize
+    ])
+
+    # 开启线程数和是否用内存存储
+    kwargs = {'num_workers': 1, 'pin_memory': True}
+
+    # -------------Step1/5 读取数据-----------
+    train_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10("/home/users/lujun.li/data/", train=True, download=True,
+                         transform=transform_train),
+        batch_size=args.batch_size, shuffle=True, **kwargs)
+    val_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10("/home/users/lujun.li/data/", train=False, transform=transform_test),
+        batch_size=args.batch_size, shuffle=True, **kwargs)
+
+    # create model
+    if 'dyrelu_cifarnet' in args.name:
+        model = DyReLUCifarNet(args.ratio)
+        logging.info('define dynamic_relu cifarnet')
+    elif 'fbs_cifarnet' in args.name:
+        model = FBSCifarNet(args.ratio)
+        logging.info('define fbs cifarnet')
+    elif 'cifarnet' in args.name:
+        model = CifarNet(args.ratio)
+        logging.info('define cifarnet')
+    elif 'dyrelu_resnet' in args.name:
+        model = DyReLUResNetCifar(args.depth, 10, args.ratio)
+        logging.info('define dynamic_relu resnet')
+    elif 'fbs_resnet' in args.name:
+        model = FBSResNetCifar(args.depth, 10, args.ratio)
+        logging.info('define fbs resnet')
+    else:
+        raise NotImplementedError
+
+    # 是否并行运算
+    if args.parallel:
+        model = torch.nn.DataParallel(model)
+    # get the number of model parameters
+    logging.info('Number of model parameters: {}'.format(
+        sum([p.data.nelement() for p in model.parameters()])))
+
+    # for training on multiple GPUs.
+    # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
+    # model = torch.nn.DataParallel(model).cuda()or
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    model = model.to(device)
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location=device)
+            args.start_epoch = checkpoint['epoch']
+            if args.start_epoch == args.epochs:
+                args.start_epoch = 0
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    cudnn.benchmark = True
+
+    # define loss function (criterion) and pptimizer
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                nesterov=True,
+                                weight_decay=args.weight_decay)
+
+    if args.eval:
+        validate(val_loader, model, criterion, args.start_epoch, device)
+        exit(0)
+
+    start_time = time.time()
+
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch)
+
+        # train for one epoch
+        train(train_loader, model, criterion, optimizer, epoch, device)
+
+        # evaluate on validation set
+        prec1 = validate(val_loader, model, criterion, epoch, device)
+
+        # remember best prec@1 and save checkpoint
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+        }, is_best)
+    logging.info('Best accuracy: {0}'.format(best_prec1))
+    training_time = (time.time() - start_time) / 3600
+    logging.info('total training time = {:.3f} hours'.format(training_time))
+
+
+def train(train_loader, model, criterion, optimizer, epoch, device):
+    """Train for one epoch on the training set"""
+    batch_time = AverageMeter()  # 训练时间
+    losses = AverageMeter()  # 损失
+    top1 = AverageMeter()  # 精度
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (input, target) in enumerate(train_loader):
+        batch_size = input.size(0)
+        target = target.to(device)
+        input = input.to(device)
+
+        # compute output
+        if args.gated: # 使用动态激活门
+            output, gate_value_l1_norm = model(input)
+            loss = criterion(output, target) + args.lamda*gate_value_l1_norm
+        else:
+            output  = model(input)
+            loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        prec1 = accuracy(output, target, topk=(1,))[0]
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            logging.info('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                loss=losses, top1=top1))
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('train_loss', losses.avg, epoch)
+        log_value('train_acc', top1.avg, epoch)
+
+
+def validate(val_loader, model, criterion, epoch, device):
+    """Perform validation on the validation set"""
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            target = target.to(device)
+            input = input.to(device)
+
+            # compute output
+            if args.gated:
+                output, _ = model(input)
+            else:
+                output = model(input)
+            loss = criterion(output, target)
+            # measure accuracy and record loss
+            prec1 = accuracy(output, target, topk=(1,))[0]
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                logging.info('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                    i, len(val_loader), batch_time=batch_time, loss=losses,
+                    top1=top1))
+
+    logging.info(' * Prec@1 {top1.avg:.3f}'.format(top1=top1))
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('val_loss', losses.avg, epoch)
+        log_value('val_acc', top1.avg, epoch)
+    return top1.avg
+
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    """Saves checkpoint to disk"""
+    directory = "runs/%s/" % (args.name)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    filename = directory + filename
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'runs/%s/' % (args.name) + 'model_best.pth.tar')
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 after 150 and 225 epochs"""
+    if 'cifarnet' in args.name:
+        lr = args.lr * (0.1 ** (epoch // 100))
+    elif 'resnet' in args.name:
+        lr = args.lr * (0.1 ** (epoch // 150)) * (0.1 ** (epoch // 225))
+    else:
+        raise NotImplementedError
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('learning_rate', lr, epoch)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+if __name__ == '__main__':
+    main()
