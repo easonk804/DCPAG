@@ -1,0 +1,337 @@
+import argparse
+import os
+import shutil
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim
+import torch.utils.data
+import logging
+import sys
+from ResNet import resnet18
+from tensorboard_logger import configure, log_value
+
+logging.getLogger().setLevel(logging.INFO)
+
+parser = argparse.ArgumentParser(description='PyTorch DynamicChannelExecution Training')
+parser.add_argument('--epochs', default=300, type=int,
+                    help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int,
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=64, type=int,
+                    help='mini-batch size (default: 64)')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    help='initial learning rate')
+parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+                    help='weight decay (default: 1e-4)')
+parser.add_argument('--print-freq', '-p', default=10, type=int,
+                    help='print frequency (default: 10)')
+parser.add_argument('--no-augment', dest='augment', action='store_false',
+                    help='whether to use standard augmentation (default: True)')
+parser.add_argument('--resume', default='', type=str,
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--name', default='DenseNet_BC_100_12', type=str,
+                    help='name of experiment')
+parser.add_argument('--tensorboard',help='Log progress to TensorBoard', action='store_true')
+parser.add_argument('--eval',help='evaluate mode', action='store_true')
+
+parser.add_argument("--reduction", type=int, default=16)
+parser.add_argument("--clip", type=float, default=5.0)
+parser.add_argument('--baseline',help='run baseline model resnet18', action='store_true')
+parser.add_argument("--alpha", type=float, default=1e-2)
+parser.add_argument("--channel_ratio", type=float, default=1.0)
+parser.add_argument("--kernel_ratio", type=float, default=1.0)
+parser.add_argument('--parallel',help='data parallel', action='store_true')
+parser.add_argument('--model', default='', type=str, help='model to be trained(default: none)')
+parser.set_defaults(augment=True)
+
+best_prec1 = 0
+args = parser.parse_args()
+
+
+def main():
+    global best_prec1, args
+    # Log
+    log_format = '[%(asctime)s] %(message)s'
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format=log_format, datefmt='%d %I:%M:%S')
+    log_path = os.path.join('./runs/%s/log'%(args.name))
+
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+    log_file = os.path.join(log_path, 'log.txt')
+    fh = logging.FileHandler(os.path.join(log_file))
+    fh.setFormatter(logging.Formatter(log_format))
+    logging.getLogger().addHandler(fh)
+
+    logging.info("args = %s", args)
+
+    if args.tensorboard: configure("runs/%s" % (args.name))
+
+    # Data loading code
+
+    train_create_dataprovider = DpflowProviderMaker(
+        conn='xyz.imagenet2012.train.normal.nomean.noaspect.uint8',
+        entry_names=['image', 'label'],
+        output_names=['data', 'label'],
+        descriptor={'data': {'shape': [args.batch_size, 3, 224, 224]}, 'label': {'shape': [args.batch_size]}},
+        buffer_size=16
+    )
+    val_create_dataprovider = DataproProviderMaker(
+        config_file='provider_config_val.txt',
+        provider_name='provider_cfg_val',
+        entry_names=['image_val', 'label'],
+        output_names=['data', 'label']
+    )
+
+    train_dataprovider = train_create_dataprovider()
+    val_dataprovider = val_create_dataprovider()
+
+    # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # transforms_ = transforms.Compose([transforms.ToTensor(), normalize, ])
+
+    # create model
+    if args.model == 'resnet18':
+        model = resnet18()
+    else:
+        raise NotImplementedError
+    # get the number of model parameters
+    logging.info('Number of model parameters: {}'.format(
+        sum([p.data.nelement() for p in model.parameters()])))
+
+    # for training on multiple GPUs.
+    # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
+    # model = torch.nn.DataParallel(model).cuda()or
+    if args.parallel:
+        model = torch.nn.DataParallel(model)
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    model = model.to(device)
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location=device)
+            args.start_epoch = checkpoint['epoch']
+            best_prec1 = checkpoint['best_prec1']
+            model.load_state_dict(checkpoint['state_dict'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    cudnn.benchmark = True
+
+    # define loss function (criterion) and optimizer
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                nesterov=True,
+                                weight_decay=args.weight_decay)
+
+    if args.eval:
+        validate(val_dataprovider, model, criterion, args.start_epoch, device)
+        exit(0)
+
+    start_time = time.time()
+
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_learning_rate(optimizer, epoch)
+
+        # train for one epoch
+        train(train_dataprovider, model, criterion, optimizer, epoch, device)
+        # evaluate on validation set
+        prec1 = validate(val_dataprovider, model, criterion, epoch, device)
+        # remember best prec@1 and save checkpoint
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+        }, is_best)
+    logging.info('Best accuracy: {0}'.format(best_prec1))
+    training_time = (time.time() - start_time) / 3600
+    logging.info('total training time = {:.3f} hours'.format(training_time))
+
+
+def train(train_dataprovider, model, criterion, optimizer, epoch, device):
+    """Train for one epoch on the training set"""
+    iters_per_epoch = 1280000 // args.batch_size
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i in range(iters_per_epoch):
+        data_dict = next(train_dataprovider)
+        input = data_dict['data']
+        target = data_dict['label']
+
+        input = torch.from_numpy(input)
+        target = torch.from_numpy(target).type(torch.LongTensor)
+
+        target = target.to(device)
+        input = input.to(device)
+
+        # compute output
+
+        output  = model(input)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output, target, topk=(1,5))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        top5.update(prec5.item(), input.size(0))
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            logging.info('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'.format(
+                   epoch, i, iters_per_epoch, batch_time=batch_time,
+                   loss=losses, top1=top1, top5=top5))
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('train_loss', losses.avg, epoch)
+        log_value('train_top1_acc', top1.avg, epoch)
+        log_value('train_top5_acc', top5.avg, epoch)
+
+
+def validate(val_dataprovider, model, criterion, epoch, device):
+    """Perform validation on the validation set"""
+    max_iters = 250
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+    with torch.no_grad():
+        for i in range(max_iters):
+            data_dict = next(val_dataprovider)
+            input = data_dict['data']
+            target = data_dict['label']
+            input = torch.from_numpy(input)
+            target = torch.from_numpy(target).type(torch.LongTensor)
+
+            input = input.to(device)
+            target = target.to(device)
+
+            # compute output
+            output = model(input)
+            loss = criterion(output, target)
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output, target, topk=(1,5))
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            top5.update(prec5.item(), input.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                logging.info('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'.format(
+                       i, max_iters, batch_time=batch_time, loss=losses,
+                       top1=top1, top5=top5))
+
+    logging.info(' * Prec@1 {top1.avg:.3f}\t'
+                 ' * Prec@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('val_loss', losses.avg, epoch)
+        log_value('val_top1_acc', top1.avg, epoch)
+        log_value('val_top5_acc', top5.avg, epoch)
+
+    return top1.avg
+
+
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    """Saves checkpoint to disk"""
+    directory = "runs/%s/" % (args.name)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    filename = directory + filename
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'runs/%s/' % (args.name) + 'model_best.pth.tar')
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 after 150 and 225 epochs"""
+    lr = args.lr * (0.1 ** (epoch // 30))
+    # log to TensorBoard
+    if args.tensorboard:
+        log_value('learning_rate', lr, epoch)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+if __name__ == '__main__':
+    main()
