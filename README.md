@@ -1,4 +1,4 @@
-# DCPAG-
+# DCPAG
 作者Shunqiang Liu于2021年4月开发了基于动态掩码ReLU的模型减枝管道，并将其应用于解决模型减枝后的性能问题。
 https://link.springer.com/article/10.1007/s10489-022-03383-w
 
