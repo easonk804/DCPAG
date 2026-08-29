@@ -1,22 +1,12 @@
-import torch.nn as nn
 import torch
-import sys
-sys.path.append('../')
-from cifar.modules import DynamicReLU, TorchGraph, DynamicReLUV1
+import torch.nn as nn
 
-_Graph = TorchGraph()
-_Graph.add_tensor_list('gate_values')
-
-def cal_gate_l1_norm(batch_size):
-    '''计算门函数的L1归一化'''
-    gate_values_list = _Graph.get_tensor_list('gate_values')
-    gate_l1_norm = 0.0
-    for gate_value in gate_values_list:
-        gate_l1_norm += torch.norm(gate_value, p=1)/batch_size
-
-    _Graph.clear_tensor_list('gate_values')
-
-    return gate_l1_norm
+from .modules import (
+    DynamicReLUV1,
+    active_channel_count,
+    collect_gate_l1,
+    validate_ratio,
+)
 
 
 class SELayer(nn.Module):
@@ -51,9 +41,10 @@ class DynamicConvBnReLU(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        self.ratio = ratio
+        self.ratio = validate_ratio(ratio)
         self.K = K
         self.reduction = reduction
+        self.last_gate_l1 = None
 
         # conv-bn-dynamic_relu
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False)
@@ -67,23 +58,21 @@ class DynamicConvBnReLU(nn.Module):
         a, b = self.dynamic_relu(input)
 
         # 不激活的通道个数
-        inactive_channels = self.out_channels - round(self.out_channels*self.ratio)
+        inactive_channels = self.out_channels - active_channel_count(
+            self.out_channels, self.ratio
+        )
         # gates, _ = torch.max(a, dim=0)
         # 得到每个样本最大值
         gates, _ = torch.max(torch.abs(a), dim=0)
-        # 如果是训练模式，就把张量嫁入进去
-        if self.training:
-            _Graph.append_tensor('gate_values', a)
+        self.last_gate_l1 = a.abs().sum() / input.size(0)
 
         # 得到值大的通道索引
-        inactive_idx = (-gates).topk(inactive_channels, dim=1)[1]
-        # 增加一个维度
-        inactive_idx = inactive_idx.unsqueeze(0)
-        # 在第一个维度的基础上复制
-        inactive_idx = inactive_idx.repeat(2,1,1,1,1)
-        # 将掩码应用到超参数a和b上
-        a = a.scatter_(2, inactive_idx, 0)
-        b = b.scatter_(2, inactive_idx, 0)
+        if inactive_channels:
+            inactive_idx = (-gates).topk(inactive_channels, dim=1).indices
+            inactive_idx = inactive_idx.unsqueeze(0).expand(self.K, -1, -1, -1, -1)
+            # Avoid in-place mutation of tensors needed by autograd.
+            a = a.scatter(2, inactive_idx, 0)
+            b = b.scatter(2, inactive_idx, 0)
 
         # dynamic_relu的形式：max{a*x+b}
         x = a*x + b
@@ -94,8 +83,9 @@ class DynamicConvBnReLU(nn.Module):
 
 class DyReLUCifarNet(nn.Module):
     '''带有Dynamic_relu的CifarNet'''
-    def __init__(self, ratio=1.0):
+    def __init__(self, ratio=1.0, num_classes=10):
         super(DyReLUCifarNet, self).__init__()
+        validate_ratio(ratio)
         self.gconv0 = DynamicConvBnReLU(3, 64, padding=0, ratio=ratio)
         self.gconv1 = DynamicConvBnReLU(64, 64, ratio=ratio)
         self.gconv2 = DynamicConvBnReLU(64, 128, stride=2, ratio=ratio)
@@ -106,12 +96,11 @@ class DyReLUCifarNet(nn.Module):
         self.gconv6 = DynamicConvBnReLU(192, 192, ratio=ratio)
         self.drop6 = nn.Dropout2d()
         self.gconv7 = DynamicConvBnReLU(192, 192,ratio=ratio)
-        self.pool = nn.AvgPool2d(8)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-        self.fc = nn.Linear(192, 10)
+        self.fc = nn.Linear(192, num_classes)
 
     def forward(self, x):
-        batch_size = x.size(0)
         x = self.gconv0(x)
         x = self.gconv1(x)
         x = self.gconv2(x)
@@ -123,9 +112,9 @@ class DyReLUCifarNet(nn.Module):
         x = self.drop6(x)
         x = self.gconv7(x)
         x = self.pool(x)
-        x = x.view(batch_size, -1)
+        x = torch.flatten(x, 1)
         x = self.fc(x)
-        gate_l1_norm = cal_gate_l1_norm(batch_size)
+        gate_l1_norm = collect_gate_l1(self, x)
 
         return  x, gate_l1_norm
 

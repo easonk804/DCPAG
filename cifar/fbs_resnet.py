@@ -1,11 +1,49 @@
 import torch
 import torch.nn as nn
-import sys
-sys.path.append('../')
-from cifar.modules import DynamicReLU, DynamicGatedReLU, TorchGraph
 
-_Graph = TorchGraph()
-_Graph.add_tensor_list('gate_values')
+from .modules import active_channel_count, collect_gate_l1, validate_ratio
+
+class GatedBN(nn.Module):
+    def __init__(self, inplanes, outplanes, ratio):
+        super(GatedBN, self).__init__()
+        self.inplanes = inplanes
+        self.outplanes = outplanes
+        self.ratio = validate_ratio(ratio)
+        self.bn = nn.BatchNorm2d(outplanes, affine=False)
+
+        self.global_pool = nn.AdaptiveAvgPool2d((1,1))
+        self.gate = nn.Linear(inplanes, outplanes)
+        self.beta = nn.Parameter(torch.zeros(outplanes))
+        self.relu = nn.Sigmoid()
+        self.last_gate_l1 = None
+        self.init_weight()
+
+    def init_weight(self):
+        nn.init.constant_(self.gate.bias, 1.0)
+        # nn.init.kaiming_normal_(self.gate.weight)
+
+    def forward(self, input1, input2):
+        batch_size = input1.size(0)
+        x = self.global_pool(input1)
+        x = x.view(batch_size, -1)
+        gates = self.relu(self.gate(x))
+        self.last_gate_l1 = gates.abs().sum() / batch_size
+
+        beta = self.beta.repeat(batch_size, 1)
+
+        if self.ratio < 1:
+            inactive_channels = self.outplanes - active_channel_count(
+                self.outplanes, self.ratio
+            )
+            inactive_idx = (-gates).topk(inactive_channels, 1)[1]
+            gates = gates.scatter(1, inactive_idx, 0)  # set inactive channels as zeros
+            beta = beta.scatter(1, inactive_idx, 0)
+
+        x = self.bn(input2)
+        x = gates.unsqueeze(2).unsqueeze(3) * x
+        x = x + beta.unsqueeze(2).unsqueeze(3)
+
+        return x
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
@@ -16,64 +54,6 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
 def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(BasicBlock, self).__init__()
-        # 如果没有BN层，就弄一个BN层
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        # 如果分组不等于1或者基础通道数不等于64，就报错
-        if groups != 1 or base_width != 64:
-            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
-        # 如果扩大倍数大于1，就报错
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
-        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
-        # conv1-bn1-Dyrelu1
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
-        # self.relu = nn.ReLU(inplace=True)
-        self.relu1 = DynamicReLU(inplanes, planes)
-        # conv2-bn2-Dyrelu2
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
-        self.relu2 = DynamicReLU(planes, planes)
-        # downsample
-        self.downsample = downsample
-        # stride
-        self.stride = stride
-
-    def forward(self, x):
-        # 短接线
-        identity = x
-        # conv1-bn1-Dyrelu1
-        out = self.conv1(x)
-        out = self.bn1(out)
-        # out = self.relu(out)
-        a1, b1 = self.relu1(x)
-        # DynamicRelu公式：max{a*x+b}
-        out = a1*out + b1
-        out1, _ = torch.max(out, dim=0)
-
-        # conv2-bn2
-        out = self.conv2(out1)
-        out = self.bn2(out)
-        # 如果下采样不为空，就将短接线直接下采样
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        # 短接与正线汇合+DynamicReLU
-        out += identity
-        # out = self.relu(out)
-        a2, b2 = self.relu2(out1)
-        out = a2*out + b2
-        out, _ = torch.max(out, dim=0)
-
-        return out
 
 
 class BasicGatedBlock(nn.Module):
@@ -90,40 +70,31 @@ class BasicGatedBlock(nn.Module):
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
-        # self.relu = nn.ReLU(inplace=True)
-        self.relu1 = DynamicGatedReLU(inplanes, planes, ratio)
-
+        self.bn1 = GatedBN(inplanes, planes, ratio)
+        self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
-        self.relu2 = DynamicGatedReLU(planes, planes, ratio)
+        self.bn2 = GatedBN(planes, planes, ratio)
         self.downsample = downsample
         self.stride = stride
 
     def forward(self, x):
         identity = x
-        # conv1-bn1-relu1
-        out = self.conv1(x)
-        out = self.bn1(out)
-        # out = self.relu(out)
-        out1, gate1 = self.relu1(x, out)
 
-        # conv2-bn2
+        out = self.conv1(x)
+        out = self.bn1(x, out)
+        out1 = self.relu(out)
+
         out = self.conv2(out1)
-        out = self.bn2(out)
+        out = self.bn2(out1, out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
 
         out += identity
-        # relu2
-        out, gate2 = self.relu2(out1, out)
-
-        if self.training:
-            _Graph.append_tensor('gate_values', gate1)
-            _Graph.append_tensor('gate_values', gate2)
+        out = self.relu(out)
 
         return out
+
 
 class Bottleneck(nn.Module):
     # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
@@ -143,28 +114,25 @@ class Bottleneck(nn.Module):
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
-
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
-
         self.conv3 = conv1x1(width, planes * self.expansion)
         self.bn3 = norm_layer(planes * self.expansion)
         self.relu = nn.ReLU(inplace=True)
-
         self.downsample = downsample
         self.stride = stride
 
     def forward(self, x):
         identity = x
-        # conv1-bn1-relu1
+
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
-        # conv2-bn2-relu2
+
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
-        # conv3-bn3
+
         out = self.conv3(out)
         out = self.bn3(out)
 
@@ -176,15 +144,17 @@ class Bottleneck(nn.Module):
 
         return out
 
-def cal_gate_l1_norm(batch_size):
-    gate_values_list = _Graph.get_tensor_list('gate_values')
-    gate_l1_norm = 0.0
-    for gate_value in gate_values_list:
-        gate_l1_norm += torch.norm(gate_value, p=1)/batch_size
+class DownSample(nn.Module):
+    def __init__(self, inplnes, outplanes, stride, ratio):
+        super(DownSample, self).__init__()
+        self.conv = conv1x1(inplnes, outplanes, stride)
+        self.bn = GatedBN(inplnes, outplanes, ratio)
 
-    _Graph.clear_tensor_list('gate_values')
+    def forward(self, input):
+        x = self.conv(input)
+        x = self.bn(input, x)
 
-    return gate_l1_norm
+        return x
 
 class ResNet(nn.Module):
 
@@ -192,14 +162,13 @@ class ResNet(nn.Module):
                  groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None, ratio=1.0):
         super(ResNet, self).__init__()
+        self.ratio = validate_ratio(ratio)
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
         self.inplanes = 64
         self.dilation = 1
-        self.ratio = ratio
-
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
             # the 2x2 stride with a dilated convolution instead
@@ -209,15 +178,12 @@ class ResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-
-        # block
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1,
                                bias=False)
-        self.bn1 = norm_layer(self.inplanes)
-        self.relu = DynamicGatedReLU(3, self.inplanes, ratio)
+        self.bn1 = GatedBN(3, self.inplanes, ratio)
+        # self.bn1 = nn.BatchNorm2d(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # layers
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
@@ -231,19 +197,10 @@ class ResNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
         # Zero-initialize the last BN in each residual branch,
         # so that the residual branch starts with zeros, and each residual block behaves like an identity.
         # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
-        if zero_init_residual:
-            for m in self.modules():
-                if isinstance(m, Bottleneck):
-                    nn.init.constant_(m.bn3.weight, 0)
-                elif isinstance(m, BasicBlock):
-                    nn.init.constant_(m.bn2.weight, 0)
+
 
     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
         norm_layer = self._norm_layer
@@ -253,47 +210,42 @@ class ResNet(nn.Module):
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),
-            )
+            # downsample = nn.Sequential(
+            #     conv1x1(self.inplanes, planes * block.expansion, stride),
+            #     norm_layer(planes * block.expansion),
+            # )
+            downsample = DownSample(self.inplanes, planes*block.expansion, stride, self.ratio)
 
         layers = []
+        block_kwargs = {}
+        if block is BasicGatedBlock:
+            block_kwargs["ratio"] = self.ratio
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
-                            self.base_width, previous_dilation, norm_layer, ratio=self.ratio))
+                            self.base_width, previous_dilation, norm_layer, **block_kwargs))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.inplanes, planes, groups=self.groups,
                                 base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer, ratio=self.ratio))
+                                norm_layer=norm_layer, **block_kwargs))
 
         return nn.Sequential(*layers)
 
     def _forward_impl(self, input):
         # See note [TorchScript super()]
-        batch_size = input.size(0)
         x = self.conv1(input)
-        x = self.bn1(x)
-        x, gate = self.relu(input, x)
-        _Graph.append_tensor('gate_values', gate)
+        x = self.bn1(input, x)
+        x = self.relu(x)
 
-        # layer1-layer2-layer3-layer4
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
 
-        # AvgPool
         x = self.avgpool(x)
-
-        # Flatten
         x = torch.flatten(x, 1)
-
-        # fc
         x = self.fc(x)
 
-        # norm
-        gate_l1_norm = cal_gate_l1_norm(batch_size)
+        gate_l1_norm = collect_gate_l1(self, x)
 
         return x, gate_l1_norm
 
@@ -304,8 +256,8 @@ class ResNet(nn.Module):
 def resnet18(num_classes, ratio):
     return ResNet(block=BasicGatedBlock, num_classes=num_classes, layers=[2,2,2,2], ratio=ratio)
 
-def resnet34(num_classes):
-    return ResNet(block=BasicBlock, num_classes=num_classes, layers=[3,4,6,3])
+def resnet34(num_classes, ratio):
+    return ResNet(block=BasicGatedBlock, num_classes=num_classes, layers=[3,4,6,3], ratio=ratio)
 
 def resnet50(num_classes):
     return ResNet(block=Bottleneck, num_classes=num_classes, layers=[3,4,6,3])
@@ -313,22 +265,27 @@ def resnet50(num_classes):
 def resnet101(num_classes):
     return ResNet(block=Bottleneck, num_classes=num_classes, layers=[3,4,23,3])
 
-def DyReLUResNetCifar(depth, num_classes, ratio):
+def FBSResNetCifar(depth, num_classes, ratio):
     if depth == 18:
         return resnet18(num_classes=num_classes, ratio=ratio)
     elif depth == 34:
-        return resnet34(num_classes=num_classes)
+        return resnet34(num_classes=num_classes, ratio=ratio)
     elif depth == 50:
-        return resnet50(num_classes=num_classes)
+        return resnet50(num_classes=num_classes, ratio=ratio)
     elif depth == 101:
-        return resnet101(num_classes=num_classes)
+        return resnet101(num_classes=num_classes, ratio=ratio)
     else:
         raise NotImplementedError
 
 if __name__ == '__main__':
     from thop.profile import profile
-    x = torch.rand(1,3,32,32)
-    model = DyReLUResNetCifar(18, 10, 0.5)
-    outputs, gate_l1_norm = model(x)
-    print('out size:{0}, gate_l1_norm:{1}'.format(outputs.size(), gate_l1_norm))
-
+    import numpy as np
+    x = torch.rand(256,3,32,32)
+    target = torch.tensor(np.random.randint(1,10,256))
+    criterion = nn.CrossEntropyLoss()
+    for i in range(10):
+        model = FBSResNetCifar(18, 10, 0.5)
+        outputs, gate_l1_norm = model.gated_forward(x)
+        print('out size:{0}, gate l1 norm:{1}'.format(outputs.size(), gate_l1_norm))
+        loss = criterion(outputs, target)
+        print('loss:{0}'.format(loss))

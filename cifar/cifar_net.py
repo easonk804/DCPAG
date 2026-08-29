@@ -1,14 +1,17 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
+
+from .modules import active_channel_count, validate_ratio
 
 class BasicConv(nn.Module):
     def __init__(self, inplanes, outplanes, kernel_size=3, stride=1, padding=1, ratio=1.0):
         super(BasicConv, self).__init__()
+        ratio = validate_ratio(ratio)
         # 只要输入通道数大于3，就需要对通道进行通道剪枝（刚输入的图片的通道数为3）
         if inplanes > 3:
-            inplanes = int(inplanes*ratio)
+            inplanes = active_channel_count(inplanes, ratio)
         # 对输出通道进行通道剪枝桠
-        outplanes = int(outplanes*ratio)
+        outplanes = active_channel_count(outplanes, ratio)
         # conv-bn-relu
         self.conv = nn.Conv2d(inplanes, outplanes, kernel_size, stride=stride, padding=padding, bias=False)
         self.bn = nn.BatchNorm2d(outplanes)
@@ -24,8 +27,9 @@ class BasicConv(nn.Module):
 
 
 class CifarNet(nn.Module):
-    def __init__(self, ratio=1.0):
+    def __init__(self, ratio=1.0, num_classes=10):
         super(CifarNet, self).__init__()
+        ratio = validate_ratio(ratio)
         # conv0-conv1-conv2-conv3
         self.gconv0 = BasicConv(3, 64, padding=0, ratio=ratio)
         self.gconv1 = BasicConv(64, 64, ratio=ratio)
@@ -42,12 +46,11 @@ class CifarNet(nn.Module):
         # conv7
         self.gconv7 = BasicConv(192, 192,ratio=ratio)
         # AvgPooling
-        self.pool = nn.AvgPool2d(8)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
         # fc
-        self.fc = nn.Linear(int(192*ratio), 10)
+        self.fc = nn.Linear(active_channel_count(192, ratio), num_classes)
 
     def forward(self, x):
-        batch_size = x.size(0)
         x = self.gconv0(x)
         x = self.gconv1(x)
         x = self.gconv2(x)
@@ -59,7 +62,7 @@ class CifarNet(nn.Module):
         x = self.drop6(x)
         x = self.gconv7(x)
         x = self.pool(x)
-        x = x.view(batch_size, -1)
+        x = torch.flatten(x, 1)
         x = self.fc(x)
 
         return  x

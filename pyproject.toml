@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcpag"
+version = "0.2.0"
+description = "Reproducible experiments for dynamic channel pruning with activation gates"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.1",
+  "torchvision>=0.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "tensorboard>=2.15"]
+
+[tool.setuptools]
+packages = ["cifar"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

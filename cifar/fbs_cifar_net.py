@@ -1,22 +1,21 @@
-import torch.nn as nn
 import torch
-from cifar.modules import TorchGraph
+import torch.nn as nn
 
-_Graph = TorchGraph()
-_Graph.add_tensor_list('gate_values')
+from .modules import active_channel_count, collect_gate_l1, validate_ratio
 
 class GatedBN(nn.Module):
     def __init__(self, inplanes, outplanes, ratio):
         super(GatedBN, self).__init__()
         self.inplanes = inplanes
         self.outplanes = outplanes
-        self.ratio = ratio
+        self.ratio = validate_ratio(ratio)
         self.bn = nn.BatchNorm2d(outplanes, affine=False)
 
         self.global_pool = nn.AdaptiveAvgPool2d((1,1))
         self.gate = nn.Linear(inplanes, outplanes)
         self.beta = nn.Parameter(torch.zeros(outplanes))
         self.relu = nn.ReLU(inplace=True)
+        self.last_gate_l1 = None
         self.init_weight()
 
     def init_weight(self):
@@ -28,13 +27,14 @@ class GatedBN(nn.Module):
         x = self.global_pool(input1)
         x = x.view(batch_size, -1)
         gates = self.relu(self.gate(x))
-        if self.training:
-            _Graph.append_tensor('gate_values', gates)
+        self.last_gate_l1 = gates.abs().sum() / batch_size
 
         beta = self.beta.repeat(batch_size, 1)
 
         if self.ratio < 1:
-            inactive_channels = self.outplanes - round(self.outplanes * self.ratio)
+            inactive_channels = self.outplanes - active_channel_count(
+                self.outplanes, self.ratio
+            )
             inactive_idx = (-gates).topk(inactive_channels, 1)[1]
             gates = gates.scatter(1, inactive_idx, 0)  # set inactive channels as zeros
             beta = beta.scatter(1, inactive_idx, 0)
@@ -59,19 +59,10 @@ class GatedConv(nn.Module):
 
         return x
 
-def cal_gate_l1_norm(batch_size):
-    gate_values_list = _Graph.get_tensor_list('gate_values')
-    gate_l1_norm = 0.0
-    for gate_value in gate_values_list:
-        gate_l1_norm += torch.norm(gate_value, p=1)/batch_size
-
-    _Graph.clear_tensor_list('gate_values')
-
-    return gate_l1_norm
-
 class FBSCifarNet(nn.Module):
-    def __init__(self, ratio=1.0):
+    def __init__(self, ratio=1.0, num_classes=10):
         super(FBSCifarNet, self).__init__()
+        ratio = validate_ratio(ratio)
         self.gconv0 = GatedConv(3, 64, padding=0, ratio=ratio)
         self.gconv1 = GatedConv(64, 64, ratio=ratio)
         self.gconv2 = GatedConv(64, 128, stride=2, ratio=ratio)
@@ -82,11 +73,10 @@ class FBSCifarNet(nn.Module):
         self.gconv6 = GatedConv(192, 192, ratio=ratio)
         self.drop6 = nn.Dropout2d()
         self.gconv7 = GatedConv(192, 192,ratio=ratio)
-        self.pool = nn.AvgPool2d(8)
-        self.fc = nn.Linear(192, 10)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(192, num_classes)
 
     def forward(self, x):
-        batch_size = x.size(0)
         x = self.gconv0(x)
         x = self.gconv1(x)
         x = self.gconv2(x)
@@ -98,10 +88,10 @@ class FBSCifarNet(nn.Module):
         x = self.drop6(x)
         x = self.gconv7(x)
         x = self.pool(x)
-        x = x.view(batch_size, -1)
+        x = torch.flatten(x, 1)
         x = self.fc(x)
 
-        gate_l1_norm = cal_gate_l1_norm(batch_size)
+        gate_l1_norm = collect_gate_l1(self, x)
 
         return  x, gate_l1_norm
 

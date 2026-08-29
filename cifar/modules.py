@@ -1,6 +1,31 @@
 import torch
 import torch.nn as nn
 
+
+def validate_ratio(ratio):
+    """Validate and normalize the fraction of active channels."""
+    ratio = float(ratio)
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+    return ratio
+
+
+def active_channel_count(channels, ratio):
+    """Return a valid number of active channels for a pruning ratio."""
+    return max(1, round(channels * validate_ratio(ratio)))
+
+
+def collect_gate_l1(module, reference):
+    """Sum per-layer gate penalties recorded during the current forward pass."""
+    penalties = [
+        child.last_gate_l1
+        for child in module.modules()
+        if torch.is_tensor(getattr(child, "last_gate_l1", None))
+    ]
+    if not penalties:
+        return reference.new_zeros(())
+    return torch.stack(penalties).sum()
+
 class TorchGraph(nn.Module):
     '''Torch图'''
     def __init__(self):
@@ -34,7 +59,7 @@ class TorchGraph(nn.Module):
 
 
 class HardSigmoid(nn.Module):
-    '''hard sigmoid-->实际上是 2*sigmoid-1 '''
+    """Piecewise-linear sigmoid used by Dynamic ReLU."""
     def __init__(self, inplace=True):
         super(HardSigmoid, self).__init__()
         self.relu = nn.ReLU6(inplace)
@@ -64,15 +89,11 @@ class DynamicReLU(nn.Module):
         # hard sigmoid
         self.sigmoid = HardSigmoid(inplace=True)
 
-        # 超参数a
-        self.alpha = torch.zeros(K, 1)  # 初始化
-        self.alpha[0][0] = 1.0  # 将第一个Kernel设为1
-        self.alpha = torch.nn.Parameter(self.alpha)  # 将超参数a参数化
-        self.alpha.requires_grad = False  # 不使用梯度下降训练超参数a
-
-        # 超参数b
-        self.beta = torch.nn.Parameter(torch.zeros(K, 1))  # 初始化b并且参数化
-        self.beta.requires_grad = False  # 不适用梯度下降训练超参数b
+        # Fixed base coefficients belong in buffers, not the optimizer.
+        alpha = torch.zeros(K, 1)
+        alpha[0][0] = 1.0
+        self.register_buffer("alpha", alpha)
+        self.register_buffer("beta", torch.zeros(K, 1))
 
         # 控制超参数a和b的scaler
         self.lambda_a = 1.0
@@ -93,17 +114,19 @@ class DynamicReLU(nn.Module):
         x = self.fc2(x)
         # 2*sigmoid-1
         x = 2 * self.sigmoid(x) - 1.0
-        # Flatten(n, K, C)-->n=2意思是a或者b
-        x = x.view(2, self.K, -1)
+        # Preserve sample boundaries. The previous reshape mixed batch and
+        # channel values whenever batch_size > 1.
+        x = x.reshape(batch_size, 2, self.K, self.outplanes)
+        x = x.permute(1, 2, 0, 3).contiguous()
         # delta_a和delta_b
         delta_a = x[0]
         delta_b = x[1]
         # 更新a和b
-        a = self.alpha.detach() + self.lambda_a * delta_a
-        b = self.beta.detach() + self.lambda_b * delta_b
+        a = self.alpha[:, None, :] + self.lambda_a * delta_a
+        b = self.beta[:, None, :] + self.lambda_b * delta_b
         # Flatten(Kernel, m, C, H, W)
-        a = a.view(self.K, batch_size, self.outplanes, 1, 1)
-        b = b.view(self.K, batch_size, self.outplanes, 1, 1)
+        a = a.unsqueeze(-1).unsqueeze(-1)
+        b = b.unsqueeze(-1).unsqueeze(-1)
 
         return a, b
 
@@ -134,10 +157,9 @@ class DynamicReLUV1(nn.Module):
         self.sigmoid = HardSigmoid(inplace=True)
 
         # alpha
-        self.alpha = torch.zeros(K, 1)
-        self.alpha[0][0] = 1.0
-        self.alpha = torch.nn.Parameter(self.alpha)
-        self.alpha.requires_grad = False
+        alpha = torch.zeros(K, 1)
+        alpha[0][0] = 1.0
+        self.register_buffer("alpha", alpha)
         self.lambda_a = 1.0
 
         # beta
@@ -155,16 +177,18 @@ class DynamicReLUV1(nn.Module):
         # sigmoid
         x = 2*self.sigmoid(x) - 1.0
 
-        # delta_a(K, -1)
-        delta_a = x.view(self.K, -1)
+        # (batch, K * channels) -> (K, batch, channels)
+        delta_a = x.reshape(batch_size, self.K, self.outplanes)
+        delta_a = delta_a.permute(1, 0, 2).contiguous()
 
         # 更新a和b
-        a = self.alpha.detach() + self.lambda_a * delta_a
-        b = self.b.repeat(batch_size, 1)
+        a = self.alpha[:, None, :] + self.lambda_a * delta_a
+        b = self.b.reshape(self.K, self.outplanes)[:, None, :]
+        b = b.expand(-1, batch_size, -1)
 
         # Flatten(K, m, C, H, W)
-        a = a.view(self.K, batch_size, self.outplanes, 1, 1)
-        b = b.view(self.K, batch_size, self.outplanes, 1, 1)
+        a = a.unsqueeze(-1).unsqueeze(-1)
+        b = b.unsqueeze(-1).unsqueeze(-1)
 
         return a, b
 
@@ -175,9 +199,10 @@ class DynamicGatedReLU(nn.Module):
         super(DynamicGatedReLU, self).__init__()
         self.inplanes = inplanes
         self.outplanes = outplanes
-        self.ratio = ratio
+        self.ratio = validate_ratio(ratio)
         self.K = K
         self.reduction = reduction
+        self.last_gate_l1 = None
 
         self.dyrelu = DynamicReLU(inplanes, outplanes, K, reduction)
 
@@ -185,18 +210,18 @@ class DynamicGatedReLU(nn.Module):
         # 获得超参数a和b
         a, b = self.dyrelu(input1)
         # 得到不激活的通道数
-        inactive_channels = self.outplanes - round(self.outplanes * self.ratio)
+        inactive_channels = self.outplanes - active_channel_count(
+            self.outplanes, self.ratio
+        )
         # 留下值较大的那些Kernel，返回的是(value, indices)
         gates, _ = torch.max(a, dim=0)
+        self.last_gate_l1 = gates.abs().sum() / input1.size(0)
         # 对于不同的输入样本找到c个值较大的通道，返回的是(value, indices)，这里我们要的是indices
-        inactive_idx = (-gates).topk(inactive_channels, dim=1)[1]
-        # 添加第一维度K
-        inactive_idx = inactive_idx.unsqueeze(0)
-        # 在第一维度K复制一次
-        inactive_idx = inactive_idx.repeat(2, 1, 1, 1, 1)
-        # 对通道维度数据按照inactive_idx重分配
-        a = a.scatter(2, inactive_idx, 0)  # scatter(dim, index, src) dim->沿着哪个维度索引  index->索引  src->用来 scatter 的源元素
-        b = b.scatter(2, inactive_idx, 0)  # scatter(dim, index, src) dim->沿着哪个维度索引  index->索引  src->用来 scatter 的源元素
+        if inactive_channels:
+            inactive_idx = (-gates).topk(inactive_channels, dim=1).indices
+            inactive_idx = inactive_idx.unsqueeze(0).expand(self.K, -1, -1, -1, -1)
+            a = a.scatter(2, inactive_idx, 0)
+            b = b.scatter(2, inactive_idx, 0)
 
         # 动态ReLU函数的表达式：max(ax+b)
         x = a * input2 + b
